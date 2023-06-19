@@ -1,17 +1,20 @@
 import asyncio
 import hashlib
 import logging
+import re
 import tomllib
-from typing import NamedTuple
+from typing import NamedTuple, Tuple
 
 import discord
 import discord.ext.commands as commands
+import requests
 import sqlalchemy
 from sqlalchemy import MetaData, func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncAttrs, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
 import httpx
+from contextlib import asynccontextmanager
 
 # Config global logging to console and file with format "[%(asctime)s] [%(levelname)s] %(message)s"
 logging.basicConfig(
@@ -186,6 +189,23 @@ session: async_sessionmaker
 async def on_ready():
     print(f"Logged in as {client.user}")
 
+    # Set bot status
+    await client.change_presence(activity=discord.Game(name="osu!"))
+
+
+@client.command(pass_context=True)
+async def help(ctx: discord.ext.commands.Context):
+    """List all commands available"""
+    user = ctx.author
+    logging.info(f"User {user} requested help")
+    await user.send(f'Welcome to the osuVNFC discord server. Here is a list of commands you can use:\n'
+                    f'{config.bot_prefix}help - Show this message\n'
+                    f'{config.bot_prefix}verify - Verify your osu! account\n'
+                    f'{config.bot_prefix}invite - Generate invite code for your friends\n'
+                    f'{config.bot_prefix}register - Register a new game account using your friend\'s invite code\n'
+                    f'{config.bot_prefix}rename - Change your osu! username\n'
+                    f'{config.bot_prefix}findme - Find your username')
+
 
 @client.command(pass_context=True)
 async def verify(ctx):
@@ -225,7 +245,6 @@ async def verify(ctx):
 
 
 @client.command(pass_context=True)
-@commands.has_role(int(config.donor_role))
 async def invite(ctx):
     """
     Create invite code for user and send it to user dm
@@ -234,6 +253,16 @@ async def invite(ctx):
     """
     user = ctx.author
     logging.info(f"User {user} requested invite code")
+    SPECIAL_PERM = False
+    # Check user role
+    roles = user.roles
+    for role in roles:
+        if role.id in [int(config.donor_role), int(config.moderator_role)]:
+            SPECIAL_PERM = True
+            break
+        if role.is_premium_subscriber():
+            SPECIAL_PERM = True
+            break
     async with session() as conn:
         # Check if user is already verified
         db_user = (await conn.execute(
@@ -244,7 +273,7 @@ async def invite(ctx):
             await user.send("You are not verified. Please verify yourself before getting invite code.")
             return
 
-        if db_user.available_invite <= 0:
+        if db_user.available_invite <= 0 and not SPECIAL_PERM:
             await user.send("You have no invite available.")
             return
 
@@ -260,17 +289,24 @@ async def invite(ctx):
         )).scalars().first().invite_code
 
         # Update number of invite available for user
-        await conn.execute(
-            sqlalchemy.update(Users).where(Users.id == db_user.id).values(available_invite=Users.available_invite - 1)
-        )
+        if not SPECIAL_PERM:
+            await conn.execute(
+                sqlalchemy.update(Users).where(Users.id == db_user.id).values(
+                    available_invite=Users.available_invite - 1)
+            )
 
-        await conn.commit()
+            await conn.commit()
 
         await user.send(f"Your invite code is {invite_code}. The code is generated and issued only once,"
                         f" and it can be used for a single account."
                         f" It's crucial to keep the code confidential and share it privately."
                         f" Cheating may lead to consequences,"
                         f" including a ban for both the person who provided the code and the person who used it.")
+        logging.info(f"User {user} got invite code {invite_code}")
+        if not SPECIAL_PERM:
+            await user.send(f"You have {db_user.available_invite - 1} invites left.")
+        else:
+            await user.send(f"Thanks to your generous. You have unlimited invites.")
 
 
 @client.command(pass_context=True)
@@ -321,22 +357,91 @@ async def register(ctx):
     email = await client.wait_for('message', check=lambda m: m.author == user)
 
     # Create a new verify code for user
-    with httpx.AsyncClient() as client:
-        r = await client.post(f"{config.api_url}/users", data={
-            "user[username]": username.content,
-            "user[password]": password.content,
-            "user[user_email]": email.content,
-            "user[invite_code]": invite_code.content,
-            "check": 0
-        })
-        if r.status_code != 200:
-            await user.send("Something went wrong. Please try again later.")
-            return
-        if r.text != 'ok':
-            await user.send(r.text)
-            return
+    r = requests.post(f"{config.api_url}/users", data={
+        "user[username]": username.content,
+        "user[password]": password.content,
+        "user[user_email]": email.content,
+        "user[invite_code]": invite_code.content,
+        "check": 0
+    })
+    if r.status_code != 200:
+        await user.send("Something went wrong. Please try again later.")
+        return
+    if r.text != 'ok':
+        await user.send(r.text)
+        return
 
     await user.send(f"Your account has been created. Please use !verify to verify your account.")
+
+
+@client.command(pass_context=True)
+async def rename(ctx: discord.ext.commands.Context):
+    """Rename user account"""
+    global client
+    user = ctx.author
+    logging.info(f"User {user} requested rename")
+
+    def check(username) -> bool:
+        pattern = re.compile(r"^[\w \[\]-]{2,15}$")
+        if not pattern.match(username):
+            return False
+
+        if "_" in username and " " in username:
+            return False
+
+        return True
+
+    async with session() as conn:
+        db_user = (await conn.execute(
+            sqlalchemy.select(Users).filter(Users.discord_id == user.id)
+        )).scalar_one_or_none()
+
+        if db_user is None:
+            await user.send("You are not verified. Please verify yourself before renaming.")
+            return
+
+        await user.send("Please enter your new username.\n"
+                        " + Your username must be between 2 and 15 characters long,"
+                        " + and can only contain letters, numbers, spaces, dashes and underscores.\n"
+                        " + You can only use either space or underscore, not both.")
+        new_username = client.wait_for("message", check=lambda m: m.author == user and check(m.content))
+        new_username = (await new_username).content
+
+        # Check if user exists
+        check_db_user = (await conn.execute(
+            sqlalchemy.select(Users).filter(Users.name == new_username)
+        )).scalar_one_or_none()
+
+        if check_db_user is not None:
+            await user.send("Username already taken.")
+            return
+
+        # Update username
+        await conn.execute(
+            sqlalchemy.update(Users).where(Users.id == db_user.id).values(name=new_username)
+        )
+        await conn.commit()
+
+        await user.send(f"Your username has been changed to {new_username}.")
+
+
+@client.command(pass_context=True)
+async def findme(ctx: discord.ext.commands.Context):
+    """Find user's account"""
+    user = ctx.author
+    logging.info(f"User {user} requested findme")
+    await user.send("Please enter your email.")
+    email = await client.wait_for('message', check=lambda m: m.author == user)
+    async with session() as conn:
+        db_user = (await conn.execute(
+            sqlalchemy.select(Users).filter(Users.email == email.content)
+        )).scalar_one_or_none()
+
+        if db_user is None:
+            await user.send("No account found.")
+            return
+
+        await user.send(f"Your username is {db_user.name}")
 
 
 if __name__ == "__main__":
