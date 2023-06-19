@@ -194,12 +194,12 @@ async def on_ready():
 
 
 @client.command(pass_context=True)
-async def help(ctx: discord.ext.commands.Context):
+async def helpme(ctx: discord.ext.commands.Context):
     """List all commands available"""
     user = ctx.author
     logging.info(f"User {user} requested help")
     await user.send(f'Welcome to the osuVNFC discord server. Here is a list of commands you can use:\n'
-                    f'{config.bot_prefix}help - Show this message\n'
+                    f'{config.bot_prefix}helpme - Show this message\n'
                     f'{config.bot_prefix}verify - Verify your osu! account\n'
                     f'{config.bot_prefix}invite - Generate invite code for your friends\n'
                     f'{config.bot_prefix}register - Register a new game account using your friend\'s invite code\n'
