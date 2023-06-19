@@ -235,7 +235,6 @@ async def verify(ctx):
         except IntegrityError:
             await conn.rollback()
             await user.send("You already have a verify code. Please use that one.")
-            return
 
         verify_code = (await conn.execute(
             sqlalchemy.select(DiscordVerify).filter(DiscordVerify.discord_id == user.id)
